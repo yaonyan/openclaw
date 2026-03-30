@@ -18,7 +18,9 @@ import {
   type Context,
   createAssistantMessageEventStream,
 } from "@mariozechner/pi-ai";
-import { createACPProvider } from "@mcpc-tech/acp-ai-provider";
+import { acpTools, createACPProvider } from "@mcpc-tech/acp-ai-provider";
+import type { Tool, ToolExecuteFunction } from "ai";
+import type { AnyAgentTool } from "openclaw/plugin-sdk/plugin-entry";
 
 /** Resolved ACP agent configuration consumed at runtime. */
 export type AcpAgentConfig = {
@@ -97,6 +99,117 @@ const EMPTY_USAGE = {
 };
 
 /**
+ * Tools that typical ACP agents (Gemini CLI, Claude Code, Codex CLI, CodeBuddy)
+ * already provide natively. Passing these through causes duplication and
+ * confusion — the ACP agent has its own read/write/exec/search tools.
+ *
+ * Only OpenClaw-specific tools that the ACP agent does NOT have natively
+ * should be forwarded as host-side tools.
+ */
+const ACP_TOOL_DENYLIST = new Set([
+  // File system — ACP agents have their own read/write/edit tools
+  "read",
+  "write",
+  "edit",
+  "apply_patch",
+  // Runtime — ACP agents have their own exec/terminal tools
+  "exec",
+  "process",
+  // Web — ACP agents have their own web search/fetch tools
+  "web_search",
+  "web_fetch",
+]);
+
+/**
+ * Filter tools to only include those that ACP agents don't natively have.
+ * This avoids tool duplication between the host (OpenClaw) and the ACP agent
+ * subprocess (e.g. CodeBuddy, Gemini CLI, Claude Code).
+ */
+function filterToolsForAcp<T extends { name: string }>(tools: T[]): T[] {
+  return tools.filter((t) => !ACP_TOOL_DENYLIST.has(t.name));
+}
+
+/**
+ * Convert agent tools to AI SDK tool records for `acpTools()`.
+ *
+ * When `agentTools` is provided (with real `execute` functions from
+ * pi-agent-core), the ACP ToolProxyHost TCP server will call these executes
+ * when the ACP agent subprocess invokes the tool through MCP — enabling
+ * true host-side tool execution.
+ *
+ * Falls back to stub execute functions (returning JSON acknowledgement) when
+ * only schema-only `contextTools` are available.
+ *
+ * Tools in {@link ACP_TOOL_DENYLIST} are filtered out to avoid duplication
+ * with the ACP agent's native tool set.
+ */
+async function convertToolsToAcpTools(
+  contextTools: Context["tools"],
+  agentTools?: AnyAgentTool[],
+): Promise<Record<string, Tool>> {
+  if ((!contextTools || contextTools.length === 0) && (!agentTools || agentTools.length === 0)) {
+    return {};
+  }
+
+  const { tool: aiTool, jsonSchema } = await import("ai");
+
+  // Build a name→AgentTool lookup from the full tools when available.
+  const agentToolsByName = new Map<string, AnyAgentTool>();
+  if (agentTools) {
+    for (const t of agentTools) {
+      agentToolsByName.set(t.name, t);
+    }
+  }
+
+  // Use agentTools as the canonical source when available, fall back to contextTools.
+  const sourceTools: Array<{ name: string; description?: string; parameters?: unknown }> =
+    agentTools && agentTools.length > 0
+      ? agentTools.map((t) => ({
+          name: t.name,
+          description: typeof t.description === "string" ? t.description : undefined,
+          parameters: t.parameters ?? { type: "object", properties: {} },
+        }))
+      : (contextTools ?? []).map((t) => ({
+          name: t.name,
+          description: typeof t.description === "string" ? t.description : undefined,
+          parameters: t.parameters ?? { type: "object", properties: {} },
+        }));
+
+  // Filter out tools that ACP agents already have natively to avoid duplication.
+  const filteredTools = filterToolsForAcp(sourceTools);
+
+  const toolMap: Record<string, Tool> = {};
+  for (const t of filteredTools) {
+    const schema = t.parameters ?? { type: "object", properties: {} };
+    const agentTool = agentToolsByName.get(t.name);
+
+    const executeFn: ToolExecuteFunction<Record<string, unknown>, string> = agentTool
+      ? async (args, _options) => {
+          // Use the real AgentTool.execute for host-side tool execution.
+          const result = await agentTool.execute(`acp-${t.name}-${Date.now()}`, args);
+          // Return the text content for the ACP agent to consume.
+          const textParts = result.content
+            .filter((c): c is { type: "text"; text: string } => c.type === "text")
+            .map((c) => c.text);
+          return textParts.length > 0
+            ? textParts.join("\n")
+            : JSON.stringify({ tool: t.name, args, status: "executed", details: result.details });
+        }
+      : async (args, _options) => {
+          // Stub: no real execute available — return acknowledgement.
+          return JSON.stringify({ tool: t.name, args, status: "executed" });
+        };
+
+    toolMap[t.name] = aiTool({
+      description: t.description,
+      inputSchema: jsonSchema(schema as Parameters<typeof jsonSchema>[0]),
+      execute: executeFn,
+    });
+  }
+  return toolMap;
+}
+
+/**
  * Convert pi-ai Context to a single prompt string for the ACP agent.
  *
  * ACP agents maintain their own conversation state internally, so we flatten
@@ -157,14 +270,22 @@ function buildPartialMessage(
  * The returned `StreamFn` spawns an ACP agent subprocess (via
  * `@mcpc-tech/acp-ai-provider`), routes the prompt through it, and converts
  * the AI SDK stream back into pi-ai's `AssistantMessageEventStream`.
+ *
+ * When `agentTools` is provided, ACP host-side tool execution is enabled:
+ * the ACP agent subprocess can invoke OpenClaw tools through the
+ * ToolProxyHost TCP bridge, and the real `AgentTool.execute` functions run
+ * on the host side.
  */
 export function createAcpStreamFn(
   _baseStreamFn: StreamFn | undefined,
   acpConfig: AcpAgentConfig,
+  agentTools?: AnyAgentTool[],
 ): StreamFn {
   return (model, context, _options) => {
     const stream = createAssistantMessageEventStream();
     const prompt = contextToPrompt(context);
+    // Kick off tool conversion eagerly (awaited inside the async block).
+    const hostToolsPromise = convertToolsToAcpTools(context.tools, agentTools);
 
     // Run the ACP interaction asynchronously, pushing events into the pi-ai
     // event stream as chunks arrive.
@@ -173,12 +294,13 @@ export function createAcpStreamFn(
       try {
         const provider = getOrCreateProvider(acpConfig);
         const acpModel = provider.languageModel();
+        const hostTools = await hostToolsPromise;
 
         const { streamText } = await import("ai");
         const acpResult = streamText({
           model: acpModel,
           prompt,
-          tools: provider.tools,
+          tools: acpTools(hostTools),
         });
 
         // Emit "start" event

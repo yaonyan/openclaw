@@ -22,12 +22,14 @@ import type {
 } from "../channels/plugins/types.js";
 import type { OpenClawConfig } from "../config/config.js";
 import type { ModelProviderConfig } from "../config/types.js";
+import type { ContextEngineFactory } from "../context-engine/registry.js";
 import type { GatewayRequestHandler } from "../gateway/server-methods/types.js";
 import type { InternalHookHandler } from "../hooks/internal-hooks.js";
 import type { HookEntry } from "../hooks/types.js";
 import type { ImageGenerationProvider } from "../image-generation/types.js";
 import type { ProviderUsageSnapshot } from "../infra/provider-usage.types.js";
 import type { MediaUnderstandingProvider } from "../media-understanding/types.js";
+import type { MemoryPromptSectionBuilder } from "../memory/prompt-section.js";
 import type { RuntimeEnv } from "../runtime.js";
 import type { RuntimeWebSearchMetadata } from "../secrets/runtime-web-tools.types.js";
 import type {
@@ -476,6 +478,14 @@ export type ProviderPrepareExtraParamsContext = {
  */
 export type ProviderWrapStreamFnContext = ProviderPrepareExtraParamsContext & {
   streamFn?: StreamFn;
+  /**
+   * Full agent tools array including `execute` functions.
+   *
+   * Providers like ACP that need to proxy tool execution to a subprocess can
+   * read this to wire host-side tool calls instead of returning stub results.
+   * Undefined when the caller does not have tool context available.
+   */
+  tools?: AnyAgentTool[];
 };
 
 /**
@@ -1365,14 +1375,9 @@ export type OpenClawPluginApi = {
    */
   registerCommand: (command: OpenClawPluginCommandDefinition) => void;
   /** Register a context engine implementation (exclusive slot — only one active at a time). */
-  registerContextEngine: (
-    id: string,
-    factory: import("../context-engine/registry.js").ContextEngineFactory,
-  ) => void;
+  registerContextEngine: (id: string, factory: ContextEngineFactory) => void;
   /** Register the system prompt section builder for this memory plugin (exclusive slot). */
-  registerMemoryPromptSection: (
-    builder: import("../memory/prompt-section.js").MemoryPromptSectionBuilder,
-  ) => void;
+  registerMemoryPromptSection: (builder: MemoryPromptSectionBuilder) => void;
   resolvePath: (input: string) => string;
   /** Register a lifecycle hook handler */
   on: <K extends PluginHookName>(

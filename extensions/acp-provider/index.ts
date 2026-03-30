@@ -133,7 +133,7 @@ export default definePluginEntry({
       },
       wrapStreamFn: (ctx) => {
         const acpConfig = resolveAcpAgentConfig(ctx.extraParams);
-        return createAcpStreamFn(ctx.streamFn, acpConfig);
+        return createAcpStreamFn(ctx.streamFn, acpConfig, ctx.tools);
       },
       isModernModelRef: () => true,
       wizard: {

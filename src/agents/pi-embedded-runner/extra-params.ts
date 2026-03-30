@@ -1,6 +1,7 @@
 import type { StreamFn } from "@mariozechner/pi-agent-core";
 import type { SimpleStreamOptions } from "@mariozechner/pi-ai";
 import { streamSimple } from "@mariozechner/pi-ai";
+import type { AnyAgentTool } from "../../agents/tools/common.js";
 import type { ThinkLevel } from "../../auto-reply/thinking.js";
 import type { OpenClawConfig } from "../../config/config.js";
 import {
@@ -216,6 +217,7 @@ export function applyExtraParamsToAgent(
   thinkingLevel?: ThinkLevel,
   agentId?: string,
   workspaceDir?: string,
+  tools?: AnyAgentTool[],
 ): void {
   const resolvedExtraParams = resolveExtraParams({
     cfg,
@@ -292,6 +294,7 @@ export function applyExtraParamsToAgent(
       extraParams: effectiveExtraParams,
       thinkingLevel,
       streamFn: providerStreamBase,
+      tools,
     },
   });
   agent.streamFn = pluginWrappedStreamFn ?? providerStreamBase;
